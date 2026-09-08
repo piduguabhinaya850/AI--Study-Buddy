@@ -195,16 +195,36 @@ def ask_gemini(prompt, system=None, temperature=0.6, max_tokens=5000):
     if system:
         config.system_instruction = system
 
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=config,
+    last_error = None
+
+    for attempt in range(4):
+        try:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
+                config=config,
+            )
+
+            if not response.text:
+                raise RuntimeError("Gemini returned an empty response.")
+
+            return response.text
+
+        except Exception as error:
+            last_error = error
+            error_text = str(error)
+
+            if "503" in error_text or "UNAVAILABLE" in error_text:
+                import time
+                time.sleep(2 ** attempt)
+                continue
+
+            raise
+
+    raise RuntimeError(
+        "Gemini is temporarily busy. "
+        "Please try again in a few seconds."
     )
-
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty response.")
-
-    return response.text
 
 
 def ask_chat(message):
