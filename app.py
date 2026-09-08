@@ -10,23 +10,12 @@ from datetime import date, datetime, timedelta
 import streamlit as st
 from dotenv import load_dotenv
 
-# Optional provider imports
 try:
     from google import genai
     from google.genai import types as gtypes
 except Exception:
     genai = None
     gtypes = None
-
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-try:
-    import requests
-except Exception:
-    requests = None
 
 try:
     import pandas as pd
@@ -47,12 +36,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-5")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 
 # --------------------------- State ------------------------------
 
@@ -72,7 +57,7 @@ DEFAULTS = {
     "skills": {},
     "projects": [],
     "tasks": [],
-    "provider_stats": {},
+    "gemini_stats": {"calls": 0, "seconds": 0.0},
     "interview_score": 0,
 }
 
@@ -135,33 +120,15 @@ st.markdown(
 }
 .metric-number { font-size:30px; font-weight:800; color:#312e81; }
 .small { color:#64748b; font-size:13px; }
-.provider-pill {
-    padding:8px 12px; border-radius:999px; background:#eef2ff;
-    color:#312e81; font-weight:700; display:inline-block;
-}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# ---------------------- Provider utilities ----------------------
+# ---------------------- Gemini AI Engine --------------------------
 
 def env(name):
     return os.getenv(name, "").strip()
-
-def available_providers():
-    providers = []
-    if env("GEMINI_API_KEY") and genai:
-        providers.append("Google Gemini")
-    if env("OPENAI_API_KEY") and OpenAI:
-        providers.append("OpenAI")
-    if env("OPENROUTER_API_KEY") and requests:
-        providers.append("OpenRouter")
-    if env("GROQ_API_KEY") and requests:
-        providers.append("Groq")
-    if requests:
-        providers.append("Ollama")
-    return providers
 
 @st.cache_resource(show_spinner=False)
 def get_gemini_client(key):
@@ -169,164 +136,59 @@ def get_gemini_client(key):
         return None
     return genai.Client(api_key=key)
 
-@st.cache_resource(show_spinner=False)
-def get_openai_client(key):
-    if not key or not OpenAI:
-        return None
-    return OpenAI(api_key=key)
+def get_gemini_key():
+    key = env("GEMINI_API_KEY")
+    if key:
+        return key
+    try:
+        return str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+    except Exception:
+        return ""
 
-def provider_error(provider):
-    return RuntimeError(
-        f"{provider} is not configured. Add the required API key in .env "
-        "or Streamlit Secrets, then restart the app."
-    )
+def require_gemini():
+    key = get_gemini_key()
+    if not key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing. Add it to Streamlit Secrets "
+            "or your local .env file."
+        )
+    if not genai or not gtypes:
+        raise RuntimeError(
+            "Google Gemini SDK is not installed. Run: pip install google-genai"
+        )
+    client = get_gemini_client(key)
+    if client is None:
+        raise RuntimeError("Unable to initialize the Google Gemini client.")
+    return client
 
 def call_gemini(prompt, system="", temperature=0.6, max_tokens=5000):
-    client = get_gemini_client(env("GEMINI_API_KEY"))
-    if not client:
-        raise provider_error("Google Gemini")
+    client = require_gemini()
     config = gtypes.GenerateContentConfig(
         temperature=temperature,
         max_output_tokens=max_tokens,
         system_instruction=system or None,
     )
+    started = time.perf_counter()
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
         config=config,
     )
-    text = getattr(response, "text", None)
-    if not text:
-        raise RuntimeError("Gemini returned an empty response.")
-    return text
-
-def call_openai(prompt, system="", temperature=0.6, max_tokens=5000):
-    client = get_openai_client(env("OPENAI_API_KEY"))
-    if not client:
-        raise provider_error("OpenAI")
-    response = client.responses.create(
-        model=OPENAI_MODEL,
-        instructions=system or None,
-        input=prompt,
-        max_output_tokens=max_tokens,
-    )
-    text = getattr(response, "output_text", None)
-    if not text:
-        raise RuntimeError("OpenAI returned an empty response.")
-    return text
-
-def call_openai_compatible(base_url, key, model, prompt, system="", temperature=0.6, max_tokens=5000):
-    if not requests:
-        raise RuntimeError("requests is not installed.")
-    if not key:
-        raise RuntimeError("Provider API key is missing.")
-    url = base_url.rstrip("/") + "/chat/completions"
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system or "You are a helpful AI assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    r = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=120,
-    )
-    if not r.ok:
-        raise RuntimeError(f"Provider HTTP {r.status_code}: {r.text[:500]}")
-    data = r.json()
-    try:
-        return data["choices"][0]["message"]["content"]
-    except Exception:
-        raise RuntimeError("Provider returned an unexpected response.")
-
-def call_ollama(prompt, system="", temperature=0.6, max_tokens=5000):
-    if not requests:
-        raise RuntimeError("requests is not installed.")
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": system or "You are a helpful AI assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-        "options": {"temperature": temperature, "num_predict": max_tokens},
-    }
-    r = requests.post(OLLAMA_URL.rstrip("/") + "/api/chat", json=payload, timeout=180)
-    if not r.ok:
-        raise RuntimeError(
-            "Ollama is not running or the model is unavailable. "
-            "Start Ollama and pull the selected model."
-        )
-    data = r.json()
-    return data.get("message", {}).get("content", "")
-
-def call_provider(provider, prompt, system="", temperature=0.6, max_tokens=5000):
-    started = time.perf_counter()
-    if provider == "Google Gemini":
-        text = call_gemini(prompt, system, temperature, max_tokens)
-    elif provider == "OpenAI":
-        text = call_openai(prompt, system, temperature, max_tokens)
-    elif provider == "OpenRouter":
-        text = call_openai_compatible(
-            "https://openrouter.ai/api/v1", env("OPENROUTER_API_KEY"),
-            OPENROUTER_MODEL, prompt, system, temperature, max_tokens
-        )
-    elif provider == "Groq":
-        text = call_openai_compatible(
-            "https://api.groq.com/openai/v1", env("GROQ_API_KEY"),
-            env("GROQ_MODEL") or "llama-3.3-70b-versatile",
-            prompt, system, temperature, max_tokens
-        )
-    elif provider == "Ollama":
-        text = call_ollama(prompt, system, temperature, max_tokens)
-    else:
-        raise RuntimeError("Unknown AI provider.")
     elapsed = round(time.perf_counter() - started, 2)
-    stats = st.session_state.provider_stats.setdefault(provider, {"calls": 0, "seconds": 0})
+    result = getattr(response, "text", None)
+    if not result:
+        raise RuntimeError("Gemini returned an empty response.")
+    stats = st.session_state.gemini_stats
     stats["calls"] += 1
     stats["seconds"] += elapsed
-    st.session_state.last_provider = provider
-    return text
+    st.session_state.last_provider = "Google Gemini"
+    return result
 
-def ask_ai(prompt, system="", provider=None, temperature=0.6, max_tokens=5000):
-    providers = available_providers()
-    if not providers:
-        raise RuntimeError(
-            "No AI provider is configured. Add GEMINI_API_KEY or OPENAI_API_KEY "
-            "(or another supported provider) to .env/Streamlit Secrets."
-        )
-    chosen = provider if provider and provider != "Auto" else providers[0]
-    if chosen not in providers:
-        chosen = providers[0]
-    try:
-        return call_provider(chosen, prompt, system, temperature, max_tokens)
-    except Exception as first_error:
-        if provider in (None, "Auto") and len(providers) > 1:
-            for fallback in providers:
-                if fallback == chosen:
-                    continue
-                try:
-                    return call_provider(fallback, prompt, system, temperature, max_tokens)
-                except Exception:
-                    continue
-        raise first_error
+def ask_ai(prompt, system="", temperature=0.6, max_tokens=5000):
+    return call_gemini(prompt, system, temperature, max_tokens)
 
-def compare_models(prompt, providers, system=""):
-    results = []
-    for p in providers:
-        try:
-            started = time.perf_counter()
-            answer = call_provider(p, prompt, system, 0.5, 4000)
-            elapsed = round(time.perf_counter() - started, 2)
-            results.append({"provider": p, "answer": answer, "seconds": elapsed, "ok": True})
-        except Exception as e:
-            results.append({"provider": p, "answer": str(e), "seconds": 0, "ok": False})
-    return results
+def ask_gemini(prompt, system="", temperature=0.6, max_tokens=5000):
+    return call_gemini(prompt, system, temperature, max_tokens)
 
 # --------------------------- Helpers -----------------------------
 
@@ -350,19 +212,22 @@ def award(points=5, topic=None):
 
 def show_error(e):
     msg = str(e)
-    if "401" in msg or "API key" in msg or "api_key" in msg:
-        st.error("🔐 Authentication failed. Check your provider API key.")
-    elif "429" in msg or "quota" in msg.lower():
-        st.error("⚡ Rate limit/quota reached. Try another provider or later.")
+    low = msg.lower()
+    if "401" in msg or "api key" in low or "api_key" in low or "authentication" in low:
+        st.error("🔐 Gemini authentication failed. Check GEMINI_API_KEY in Streamlit Secrets.")
+    elif "429" in msg or "quota" in low or "resource exhausted" in low:
+        st.error("⚡ Gemini quota/rate limit reached. Check your Gemini usage/quota and try again.")
+    elif "503" in msg or "unavailable" in low:
+        st.error("🟠 Gemini is temporarily busy/unavailable. Please wait a moment and try again.")
     else:
         st.error("Something went wrong: " + msg)
 
-def run_ai_button(label, prompt, system="", provider=None, temperature=0.5,
+def run_ai_button(label, prompt, system="", temperature=0.5,
                   max_tokens=6000, points=10, topic=None, filename="AI_Result.md"):
     if st.button(label, type="primary", use_container_width=True):
         with st.spinner("AI is working..."):
             try:
-                result = ask_ai(prompt, system, provider, temperature, max_tokens)
+                result = ask_ai(prompt, system, temperature, max_tokens)
                 st.markdown(result)
                 save_result(result)
                 download_result(filename)
@@ -393,79 +258,33 @@ def profile_context():
 
 # ------------------------- File analysis -------------------------
 
-def analyze_uploaded_file(uploaded, instruction, provider):
+def analyze_uploaded_file(uploaded, instruction):
+    client = require_gemini()
     suffix = os.path.splitext(uploaded.name)[1].lower()
-    if provider == "Google Gemini":
-        client = get_gemini_client(env("GEMINI_API_KEY"))
-        if not client:
-            raise provider_error("Google Gemini")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".bin") as tmp:
-            tmp.write(uploaded.getvalue())
-            path = tmp.name
-        try:
-            remote = client.files.upload(file=path)
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[instruction, remote],
-                config=gtypes.GenerateContentConfig(
-                    temperature=0.4,
-                    max_output_tokens=8000,
-                ),
-            )
-            if not response.text:
-                raise RuntimeError("Gemini returned an empty response.")
-            return response.text
-        finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
 
-    # OpenAI supports direct file input through the Responses API.
-    if provider == "OpenAI":
-        client = get_openai_client(env("OPENAI_API_KEY"))
-        if not client:
-            raise provider_error("OpenAI")
-        suffix = suffix or ".bin"
-        mime = uploaded.type or "application/octet-stream"
-        import base64
-        encoded = base64.b64encode(uploaded.getvalue()).decode("utf-8")
-        data_url = f"data:{mime};base64,{encoded}"
-        content_type = "input_file"
-        if mime.startswith("image/"):
-            content_type = "input_image"
-        content = [{"type": "input_text", "text": instruction}]
-        if content_type == "input_image":
-            content.append({"type": "input_image", "image_url": data_url})
-        else:
-            content.append({
-                "type": "input_file",
-                "filename": uploaded.name,
-                "file_data": data_url,
-            })
-        response = client.responses.create(
-            model=OPENAI_MODEL,
-            input=[{"role": "user", "content": content}],
-            max_output_tokens=8000,
-        )
-        return response.output_text
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".bin") as tmp:
+        tmp.write(uploaded.getvalue())
+        path = tmp.name
 
-    # Universal fallback: text files can be sent to compatible providers.
-    raw = uploaded.getvalue()
-    if suffix in {".txt", ".md", ".csv", ".json", ".py", ".sql"}:
-        try:
-            text = raw.decode("utf-8", errors="ignore")
-        except Exception:
-            text = str(raw)
-        return ask_ai(
-            instruction + "\n\nFILE CONTENT:\n" + text[:120000],
-            provider=provider,
-            max_tokens=8000,
+    try:
+        remote = client.files.upload(file=path)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[instruction, remote],
+            config=gtypes.GenerateContentConfig(
+                temperature=0.4,
+                max_output_tokens=8000,
+            ),
         )
-    raise RuntimeError(
-        "This provider supports text fallback only. Use Google Gemini or OpenAI "
-        "for PDF/image document analysis."
-    )
+        result = getattr(response, "text", None)
+        if not result:
+            raise RuntimeError("Gemini returned an empty response.")
+        return result
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 # ---------------------------- Sidebar ---------------------------
 
@@ -481,10 +300,10 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    providers = available_providers()
-    provider_options = ["Auto"] + providers
-    provider = st.selectbox("🤖 AI Engine", provider_options)
-    st.caption("Auto uses the first configured provider and falls back when possible.")
+    st.markdown("### 🤖 AI Engine")
+    st.success("🟢 Google Gemini")
+    st.caption(f"Model: `{GEMINI_MODEL}`")
+    st.caption("One secure API key powers the entire platform.")
 
     page = st.radio(
         "Workspace",
@@ -531,7 +350,7 @@ st.markdown(
         <h1>🧠 AI Study Buddy 360</h1>
         <p>One intelligent workspace for learning, coding, career growth,
         research and professional productivity.</p>
-        <span class="badge">MULTI-AI • GEMINI • OPENAI • OPENROUTER • GROQ • OLLAMA</span>
+        <span class="badge">POWERED BY GOOGLE GEMINI • ONE API KEY • 360 AI WORKSPACE</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -596,7 +415,7 @@ executed unless it was provided in this application.
 """
             with st.spinner("Designing your intelligent workflow..."):
                 try:
-                    result = ask_ai(workflow_prompt, provider=provider, max_tokens=7000)
+                    result = ask_ai(workflow_prompt, max_tokens=7000)
                     st.markdown(result)
                     save_result(result)
                     download_result("AI_Command_Workflow.md")
@@ -653,7 +472,6 @@ elif page == "💬 AI Chat":
                             "Teach clearly, challenge assumptions, personalize answers, "
                             "and suggest practical next steps."
                         ),
-                        provider=provider,
                         max_tokens=6000,
                     )
                     st.markdown(answer)
@@ -665,46 +483,46 @@ elif page == "💬 AI Chat":
 # =========================== MODEL LAB ===========================
 
 elif page == "🧠 AI Model Lab":
-    st.subheader("🧠 Multi-AI Model Laboratory")
-    st.write("Compare configured AI providers on the same task.")
-    if len(providers) < 2:
-        st.info("Configure at least two providers to compare models.")
+    st.subheader("🧠 Gemini AI Laboratory")
+    st.write(
+        "Experiment with the same Gemini engine used across AI Study Buddy 360. "
+        "Test prompts, teaching styles and structured outputs."
+    )
+    st.info(f"🤖 Active model: **{GEMINI_MODEL}**")
+
     prompt = st.text_area(
-        "Comparison task",
-        height=150,
+        "Laboratory task",
+        height=180,
         placeholder="Explain machine learning to a beginner and give a practical example.",
     )
-    selected = st.multiselect(
-        "Models/providers to compare",
-        providers,
-        default=providers[:2],
+    mode = st.selectbox(
+        "Experiment mode",
+        ["Best Answer", "Step-by-Step Tutor", "Interview Expert", "Exam Coach", "Creative Explainer"],
     )
-    if st.button("⚖️ Compare AI Responses", type="primary", use_container_width=True):
-        if not prompt.strip() or len(selected) < 2:
-            st.warning("Enter a task and select at least two providers.")
+
+    if st.button("🧪 Run Gemini Experiment", type="primary", use_container_width=True):
+        if not prompt.strip():
+            st.warning("Enter a task first.")
         else:
-            with st.spinner("Running the same task across models..."):
-                results = compare_models(prompt, selected)
-            for item in results:
-                st.markdown(f"### {item['provider']} · {item['seconds']}s")
-                if item["ok"]:
-                    st.markdown(item["answer"])
-                else:
-                    st.error(item["answer"])
-            good = [r for r in results if r["ok"]]
-            if len(good) >= 2:
-                with st.spinner("AI judge is comparing the responses..."):
-                    judge = ask_ai(
-                        "Compare these AI answers for correctness, clarity, completeness and usefulness. "
-                        "Recommend the strongest answer and explain why.\n\n" +
-                        "\n\n".join(f"MODEL {i+1} ({r['provider']}):\n{r['answer']}" for i, r in enumerate(good)),
-                        provider=provider,
-                        max_tokens=5000,
-                    )
-                st.markdown("### 🏆 AI Judge")
-                st.markdown(judge)
-                save_result(judge)
-                download_result("AI_Model_Comparison.md")
+            system = (
+                "You are the advanced reasoning engine inside AI Study Buddy 360. "
+                "Produce accurate, structured and practical responses."
+            )
+            experiment_prompt = (
+                f"Experiment mode: {mode}\n\n"
+                f"User task:\n{prompt}\n\n"
+                "Give the strongest useful answer. Use headings, examples and "
+                "actionable takeaways where appropriate."
+            )
+            with st.spinner("Gemini is running the experiment..."):
+                try:
+                    result = ask_ai(experiment_prompt, system=system, max_tokens=7000)
+                    st.markdown(result)
+                    save_result(result)
+                    download_result("Gemini_AI_Experiment.md")
+                    award(10)
+                except Exception as e:
+                    show_error(e)
 
 # ============================== LEARN ============================
 
@@ -738,36 +556,122 @@ Include:
 """
     run_ai_button(
         "✨ Generate Complete Lesson", prompt,
-        system="You are an expert university tutor. Be accurate and never invent facts.",
-        provider=provider, temperature=0.5, max_tokens=7000,
+        system="You are an expert university tutor. Be accurate and never invent facts.", temperature=0.5, max_tokens=7000,
         points=10, topic=topic, filename="AI_Lesson.md"
     )
 
 # =========================== SMART NOTES =========================
+# =========================== SMART NOTES =======================
 
 elif page == "📝 Smart Notes":
     st.subheader("📝 Smart Notes Studio")
-    notes = st.text_area("Paste notes", height=320)
-    output = st.selectbox(
-        "Output",
-        ["Complete Summary", "Exam Notes", "One-Page Revision", "Key Points",
-         "Mind Map Structure", "Cheat Sheet", "Question Bank"],
-    )
-    detail = st.select_slider("Detail", ["Short", "Balanced", "Detailed"], value="Balanced")
-    prompt = f"""
-Transform these notes into {output}. Detail level: {detail}.
-Preserve important facts, remove repetition, explain difficult terms,
-use headings and bullets, include formulas when relevant, add memory tricks,
-and finish with rapid revision questions.
 
-NOTES:
+    st.info(
+        "📄 Upload a PDF, paste your notes, or use both. "
+        "Gemini will turn your material into smart study notes."
+    )
+
+    uploaded_pdf = st.file_uploader(
+        "📄 Upload your study PDF (optional)",
+        type=["pdf"],
+        help="Upload lecture notes, textbooks, study material, etc.",
+    )
+
+    notes = st.text_area(
+        "📝 Paste additional notes (optional)",
+        height=250,
+        placeholder=(
+            "Paste lecture notes, textbook notes, class material "
+            "or any additional information..."
+        ),
+    )
+
+    output = st.selectbox(
+        "Output type",
+        [
+            "Complete Summary",
+            "Exam Notes",
+            "One-Page Revision",
+            "Key Points",
+            "Mind Map Structure",
+            "Cheat Sheet",
+            "Important Questions",
+        ],
+    )
+
+    detail = st.select_slider(
+        "Detail level",
+        ["Short", "Balanced", "Detailed"],
+        value="Balanced",
+    )
+
+    if st.button(
+        "🧠 Generate Smart Notes",
+        type="primary",
+        use_container_width=True,
+    ):
+
+        if uploaded_pdf is None and not notes.strip():
+            st.warning(
+                "📄 Please upload a PDF or 📝 paste some notes first."
+            )
+
+        else:
+            instruction = f"""
+You are an expert AI study assistant.
+
+Create {output} from the student's learning material.
+
+Detail level: {detail}
+
+Follow these rules:
+- Preserve important facts and concepts.
+- Remove unnecessary repetition.
+- Explain difficult concepts simply.
+- Use clear headings and bullet points.
+- Highlight important definitions.
+- Include formulas when relevant.
+- Include examples when useful.
+- Add memory tricks when useful.
+- Make the result useful for exams and revision.
+- Finish with a section called "Quick Revision Questions".
+- Do not invent facts that are not present in the material.
+
+"""
+
+            if notes.strip():
+                instruction += f"""
+
+ADDITIONAL STUDENT NOTES:
 {notes}
 """
-    run_ai_button(
-        "🧠 Transform Notes", prompt, provider=provider,
-        temperature=0.4, max_tokens=7000, points=10,
-        filename="AI_Study_Notes.md"
-    )
+
+            with st.spinner("🤖 Gemini is creating your smart notes..."):
+                try:
+
+                    if uploaded_pdf is not None:
+                        result = analyze_file(
+                            uploaded_pdf,
+                            instruction,
+                        )
+                    else:
+                        result = ask_gemini(
+                            instruction,
+                            temperature=0.4,
+                            max_tokens=6000,
+                        )
+
+                    st.success("✅ Smart notes generated successfully!")
+                    st.markdown(result)
+
+                    save_result(result)
+
+                    result_actions("AI_Study_Notes.md")
+
+                    st.session_state.points += 10
+
+                except Exception as e:
+                    show_error(e)
 
 # =========================== QUIZ ARENA ==========================
 
@@ -794,7 +698,7 @@ EXPLANATION
 Make the questions useful for learning and interviews.
 """
     run_ai_button(
-        "🎮 Generate Quiz", prompt, provider=provider, temperature=0.6,
+        "🎮 Generate Quiz", prompt, temperature=0.6,
         max_tokens=8000, points=15, filename="AI_Quiz.md"
     )
 
@@ -818,7 +722,7 @@ Progress from fundamentals to harder concepts. Focus on understanding.
         else:
             with st.spinner("Creating flashcards..."):
                 try:
-                    result = ask_ai(prompt, provider=provider, temperature=0.6, max_tokens=7000)
+                    result = ask_ai(prompt, temperature=0.6, max_tokens=7000)
                     st.markdown(result)
                     save_result(result)
                     download_result("AI_Flashcards.md")
@@ -854,7 +758,7 @@ active recall, revision cycles, mock tests, weak-topic strategy,
 final revision and measurable goals.
 """
     run_ai_button(
-        "📅 Build My Plan", prompt, provider=provider, temperature=0.5,
+        "📅 Build My Plan", prompt, temperature=0.5,
         max_tokens=8000, points=20, filename="AI_Study_Plan.md"
     )
 
@@ -884,7 +788,7 @@ Create:
 10. exam-day checklist
 """
     run_ai_button(
-        "🚀 Activate Exam Mode", prompt, provider=provider, temperature=0.45,
+        "🚀 Activate Exam Mode", prompt, temperature=0.45,
         max_tokens=8000, points=25, filename="AI_Exam_Strategy.md"
     )
 
@@ -918,8 +822,7 @@ data flow, scalability, security and trade-offs.
 """
     run_ai_button(
         "🧑‍💻 Analyze / Build", prompt,
-        system="Be technically precise. Never claim code was executed unless it was.",
-        provider=provider, temperature=0.35, max_tokens=9000,
+        system="Be technically precise. Never claim code was executed unless it was.", temperature=0.35, max_tokens=9000,
         points=15, filename="AI_Developer_Review.md"
     )
 
@@ -981,7 +884,7 @@ Do not invent values that are not in the supplied sample/schema.
 """
                 with st.spinner("Analyzing dataset..."):
                     try:
-                        result = ask_ai(prompt, provider=provider, max_tokens=8000)
+                        result = ask_ai(prompt, max_tokens=8000)
                         st.markdown(result)
                         save_result(result)
                         download_result("AI_Data_Report.md")
@@ -1016,22 +919,16 @@ elif page == "📄 Document Intelligence":
         elif not instruction.strip():
             st.warning("Tell AI what to do.")
         else:
-            chosen = provider if provider != "Auto" else (
-                "Google Gemini" if "Google Gemini" in providers else providers[0] if providers else None
-            )
-            if not chosen:
-                st.error("Configure an AI provider first.")
-            else:
-                with st.spinner("Analyzing your material..."):
-                    try:
-                        result = analyze_uploaded_file(uploaded, instruction, chosen)
-                        st.markdown(result)
-                        save_result(result)
-                        download_result("AI_Document_Analysis.md")
-                        st.session_state.documents.append(uploaded.name)
-                        award(20)
-                    except Exception as e:
-                        show_error(e)
+            with st.spinner("Analyzing your material with Gemini..."):
+                try:
+                    result = analyze_uploaded_file(uploaded, instruction)
+                    st.markdown(result)
+                    save_result(result)
+                    download_result("AI_Document_Analysis.md")
+                    st.session_state.documents.append(uploaded.name)
+                    award(20)
+                except Exception as e:
+                    show_error(e)
 
 # ======================= INTERVIEW SIMULATOR =====================
 
@@ -1068,7 +965,7 @@ After the question, give a short hint on what a strong answer should contain.
 """
         with st.spinner("Interviewer is evaluating..."):
             try:
-                result = ask_ai(prompt, provider=provider, temperature=0.6, max_tokens=5000)
+                result = ask_ai(prompt, temperature=0.6, max_tokens=5000)
                 st.markdown(result)
                 save_result(result)
                 download_result("AI_Interview_Session.md")
@@ -1106,7 +1003,7 @@ For portfolio: evaluate projects, proof of impact and presentation quality.
 For roadmap: give a 30/60/90 day plan.
 """
     run_ai_button(
-        "🚀 Run Career Analysis", prompt, provider=provider,
+        "🚀 Run Career Analysis", prompt,
         temperature=0.45, max_tokens=8000, points=20,
         filename="AI_Career_Analysis.md"
     )
@@ -1157,7 +1054,7 @@ Create:
 Do not pretend that code has been implemented.
 """
     run_ai_button(
-        "🏗️ Architect My Project", prompt, provider=provider,
+        "🏗️ Architect My Project", prompt,
         temperature=0.45, max_tokens=10000, points=30,
         filename="AI_Project_Blueprint.md"
     )
@@ -1189,7 +1086,7 @@ Create:
 Clearly label ideas/inferences and do not invent citations.
 """
     run_ai_button(
-        "🔬 Build Research Plan", prompt, provider=provider,
+        "🔬 Build Research Plan", prompt,
         temperature=0.45, max_tokens=8000, points=25,
         filename="AI_Research_Plan.md"
     )
@@ -1223,7 +1120,7 @@ Return:
 Represent dependencies as A -> B where useful.
 """
     run_ai_button(
-        "🧭 Generate Skill Graph", prompt, provider=provider,
+        "🧭 Generate Skill Graph", prompt,
         temperature=0.5, max_tokens=8000, points=25,
         filename="AI_Skill_Graph.md"
     )
@@ -1249,7 +1146,7 @@ practice, self-test and final recap. Give concrete tasks.
         else:
             with st.spinner("Creating your focus session..."):
                 try:
-                    result = ask_ai(prompt, provider=provider, temperature=0.45, max_tokens=5000)
+                    result = ask_ai(prompt, temperature=0.45, max_tokens=5000)
                     st.markdown(result)
                     save_result(result)
                     download_result("AI_Focus_Session.md")
@@ -1269,21 +1166,23 @@ elif page == "📈 Analytics":
     c3.metric("Topics", st.session_state.topics)
     c4.metric("Flashcards", st.session_state.flashcards)
 
-    st.markdown("### Provider Performance")
-    if st.session_state.provider_stats:
-        rows = []
-        for name, stats in st.session_state.provider_stats.items():
-            calls = stats["calls"]
-            rows.append({
-                "Provider": name,
-                "Calls": calls,
-                "Total seconds": round(stats["seconds"], 2),
-                "Avg seconds": round(stats["seconds"] / max(calls, 1), 2),
-            })
+    st.markdown("### Gemini Performance")
+    stats = st.session_state.gemini_stats
+    if stats["calls"]:
+        avg = stats["seconds"] / stats["calls"]
         if pd:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            st.dataframe(
+                pd.DataFrame([{
+                    "AI Engine": "Google Gemini",
+                    "Model": GEMINI_MODEL,
+                    "Calls": stats["calls"],
+                    "Total seconds": round(stats["seconds"], 2),
+                    "Average seconds": round(avg, 2),
+                }]),
+                use_container_width=True,
+            )
     else:
-        st.info("Provider usage will appear after AI calls.")
+        st.info("Gemini usage will appear after your first AI call.")
 
     st.markdown("### Learning Snapshot")
     st.markdown(
@@ -1294,7 +1193,7 @@ elif page == "📈 Analytics":
         <b>Quizzes:</b> {st.session_state.quizzes}<br><br>
         <b>Documents:</b> {len(st.session_state.documents)}<br><br>
         <b>Streak:</b> 🔥 {st.session_state.streak} days<br><br>
-        <b>Last AI provider:</b> {st.session_state.last_provider or "None"}
+        <b>AI Engine:</b> {st.session_state.last_provider or "Google Gemini"}
         </div>
         """,
         unsafe_allow_html=True,
@@ -1308,28 +1207,36 @@ elif page == "📈 Analytics":
 elif page == "⚙️ Settings":
     st.subheader("⚙️ Platform Settings")
     st.write(f"**AI Study Buddy 360 v{APP_VERSION}**")
-    st.markdown("### Configured providers")
-    for p in ["Google Gemini", "OpenAI", "OpenRouter", "Groq", "Ollama"]:
-        st.write(("🟢" if p in providers else "⚪") + " " + p)
 
-    st.markdown("### Environment variables")
+    st.markdown("### 🤖 AI Engine")
+    st.success("🟢 Google Gemini — Active")
+    st.write(f"**Model:** `{GEMINI_MODEL}`")
+    st.write("**Architecture:** Single-provider · Single-key · Secure AI gateway")
+
+    st.markdown("### 🔐 Streamlit Secrets")
     st.code(
-        """GEMINI_API_KEY=
-OPENAI_API_KEY=
-OPENROUTER_API_KEY=
-GROQ_API_KEY=
-GROQ_MODEL=llama-3.3-70b-versatile
-OPENAI_MODEL=gpt-5
-GEMINI_MODEL=gemini-3.7-flash
-OPENROUTER_MODEL=openai/gpt-5
-OLLAMA_MODEL=llama3.2
-OLLAMA_URL=http://localhost:11434
-""",
-        language="text",
+        """GEMINI_API_KEY = "your_actual_gemini_key"
+GEMINI_MODEL = "gemini-3.7-flash" """,
+        language="toml",
     )
     st.warning(
-        "Never paste API keys into source code or commit them to GitHub. "
-        "Use .env locally and Streamlit Secrets when deployed."
+        "Never paste your real API key into app.py or GitHub. "
+        "Use Streamlit Secrets for deployment and .env for local development."
+    )
+
+    st.markdown("### ✅ Simplified configuration")
+    st.markdown(
+        """
+        This version intentionally uses **one API key only: Google Gemini**.
+
+        • No OpenAI key required  
+        • No OpenRouter key required  
+        • No Groq key required  
+        • No Ollama setup required  
+
+        All learning, career, coding, document, research and project features
+        use the same Gemini AI engine.
+        """
     )
 
 # ---------------------------- Footer ----------------------------
@@ -1337,7 +1244,7 @@ OLLAMA_URL=http://localhost:11434
 st.markdown(
     """
     <div style="text-align:center;color:#64748b;padding:35px 0 10px">
-        <b>AI Study Buddy 360</b> · Multi-AI Learning · Career · Work OS
+        <b>AI Study Buddy 360</b> · Gemini AI · Learning · Career · Work OS
         <br>
         Learn smarter · Build faster · Grow continuously
     </div>
