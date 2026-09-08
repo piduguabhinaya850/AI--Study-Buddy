@@ -20,7 +20,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-MODEL = "gemini-3.7-flash"
+MODEL = "gemini-2.5-flash"
 
 
 # ----------------------------- API -----------------------------
