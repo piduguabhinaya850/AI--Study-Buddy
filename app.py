@@ -601,13 +601,29 @@ elif page == "📚 Explain Topic":
 
 # =========================== SMART NOTES =======================
 
+# =========================== SMART NOTES =======================
+
 elif page == "📝 Smart Notes":
     st.subheader("📝 Smart Notes Studio")
 
+    st.info(
+        "📄 Upload a PDF, paste your notes, or use both. "
+        "Gemini will turn your material into smart study notes."
+    )
+
+    uploaded_pdf = st.file_uploader(
+        "📄 Upload your study PDF (optional)",
+        type=["pdf"],
+        help="Upload lecture notes, textbooks, study material, etc.",
+    )
+
     notes = st.text_area(
-        "Paste your notes",
-        height=300,
-        placeholder="Paste lecture notes, textbook notes or class material...",
+        "📝 Paste additional notes (optional)",
+        height=250,
+        placeholder=(
+            "Paste lecture notes, textbook notes, class material "
+            "or any additional information..."
+        ),
     )
 
     output = st.selectbox(
@@ -619,56 +635,87 @@ elif page == "📝 Smart Notes":
             "Key Points",
             "Mind Map Structure",
             "Cheat Sheet",
+            "Important Questions",
         ],
     )
 
     detail = st.select_slider(
-        "Detail",
+        "Detail level",
         ["Short", "Balanced", "Detailed"],
         value="Balanced",
     )
 
     if st.button(
-        "🧠 Transform Notes",
+        "🧠 Generate Smart Notes",
         type="primary",
         use_container_width=True,
     ):
-        if not notes.strip():
-            st.warning("Paste your notes first.")
-        else:
-            prompt = (
-                "Transform the following study notes into "
-                + output
-                + ". Detail level: "
-                + detail
-                + """
-\nRules:
-- Preserve important facts.
-- Remove repetition.
-- Explain difficult terms.
-- Use headings and bullets.
-- Include formulas when relevant.
-- Add memory tricks when useful.
-- Finish with rapid revision questions.
 
-NOTES:
-"""
-                + notes
+        if uploaded_pdf is None and not notes.strip():
+            st.warning(
+                "📄 Please upload a PDF or 📝 paste some notes first."
             )
 
-            with st.spinner("Creating smart notes..."):
+        else:
+            instruction = f"""
+You are an expert AI study assistant.
+
+Create {output} from the student's learning material.
+
+Detail level: {detail}
+
+Follow these rules:
+- Preserve important facts and concepts.
+- Remove unnecessary repetition.
+- Explain difficult concepts simply.
+- Use clear headings and bullet points.
+- Highlight important definitions.
+- Include formulas when relevant.
+- Include examples when useful.
+- Add memory tricks when useful.
+- Make the result useful for exams and revision.
+- Finish with a section called "Quick Revision Questions".
+- Do not invent facts that are not present in the material.
+
+"""
+
+            if notes.strip():
+                instruction += f"""
+
+ADDITIONAL STUDENT NOTES:
+{notes}
+"""
+
+            with st.spinner("🤖 Gemini is creating your smart notes..."):
                 try:
-                    result = ask_gemini(
-                        prompt,
-                        temperature=0.4,
-                        max_tokens=6000,
-                    )
+
+                    if uploaded_pdf is not None:
+                        result = analyze_file(
+                            uploaded_pdf,
+                            instruction,
+                        )
+                    else:
+                        result = ask_gemini(
+                            instruction,
+                            temperature=0.4,
+                            max_tokens=6000,
+                        )
+
+                    st.success("✅ Smart notes generated successfully!")
                     st.markdown(result)
+
                     save_result(result)
+
                     result_actions("AI_Study_Notes.md")
+
                     st.session_state.points += 10
+
                 except Exception as e:
                     show_error(e)
+
+   
+
+
 
 
 # =========================== QUIZ ARENA ========================
